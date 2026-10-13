@@ -97,7 +97,7 @@
       items.forEach((it, ti) => {
         const [title, subs] = Array.isArray(it) ? it : [it, []];
         tasks.push({
-          id: uuid(), category_id: id, title, owner: null, status: 'not_started', notes: '',
+          id: uuid(), category_id: id, title, owners: [], status: 'not_started', notes: '',
           links: [], subtasks: subs.map(text => ({ text, done: false })), position: ti,
           created_at: now(), updated_at: now(), status_changed_at: now(), status_changed_by: null,
         });
@@ -202,7 +202,14 @@
     state.tasks = (d.tasks || []).map(normTask);
   }
   function normTask(t) {
-    return { ...t, links: Array.isArray(t.links) ? t.links : [], subtasks: Array.isArray(t.subtasks) ? t.subtasks : [], notes: t.notes || '' };
+    return {
+      ...t,
+      // Tasks can have several owners; older rows only had a single `owner`.
+      owners: Array.isArray(t.owners) ? t.owners : (t.owner ? [t.owner] : []),
+      links: Array.isArray(t.links) ? t.links : [],
+      subtasks: Array.isArray(t.subtasks) ? t.subtasks : [],
+      notes: t.notes || '',
+    };
   }
 
   const members = () => state.settings.members || [];
@@ -282,7 +289,7 @@
   function addTask(category_id, title) {
     const siblings = tasksIn(category_id);
     const row = {
-      id: uuid(), category_id, title, owner: null, status: 'not_started', notes: '', links: [], subtasks: [],
+      id: uuid(), category_id, title, owners: [], status: 'not_started', notes: '', links: [], subtasks: [],
       position: siblings.length ? Math.max(...siblings.map(t => t.position)) + 1 : 0,
       created_at: now(), updated_at: now(), status_changed_at: now(), status_changed_by: state.me || null,
     };
@@ -338,29 +345,29 @@
     newName = newName.trim();
     if (!newName || newName === oldName) return render();
     if (members().includes(newName)) { toast(`${newName} is already in the band.`, true); return render(); }
-    const affected = state.tasks.filter(t => t.owner === oldName);
+    const affected = state.tasks.filter(t => t.owners.includes(oldName));
     const list = members().map(m => (m === oldName ? newName : m));
     if (state.me === oldName) { state.me = newName; LS.set('me', newName); }
     if (state.filter.owner === oldName) setFilter('owner', newName);
     return mutate(
-      () => { state.settings.members = list; affected.forEach(t => { t.owner = newName; }); },
+      () => { state.settings.members = list; affected.forEach(t => { t.owners = t.owners.map(o => (o === oldName ? newName : o)); }); },
       async () => {
         await store.update('settings', 1, touch({ members: list }));
-        for (const t of affected) await store.update('tasks', t.id, touch({ owner: newName }));
+        for (const t of affected) await store.update('tasks', t.id, touch({ owners: t.owners }));
       },
       { skipDrawer: true },
     );
   }
 
   function removeMember(name) {
-    const affected = state.tasks.filter(t => t.owner === name);
+    const affected = state.tasks.filter(t => t.owners.includes(name));
     const list = members().filter(m => m !== name);
     if (state.filter.owner === name) setFilter('owner', 'all');
     return mutate(
-      () => { state.settings.members = list; affected.forEach(t => { t.owner = null; }); },
+      () => { state.settings.members = list; affected.forEach(t => { t.owners = t.owners.filter(o => o !== name); }); },
       async () => {
         await store.update('settings', 1, touch({ members: list }));
-        for (const t of affected) await store.update('tasks', t.id, touch({ owner: null }));
+        for (const t of affected) await store.update('tasks', t.id, touch({ owners: t.owners }));
       },
     );
   }
@@ -374,8 +381,8 @@
   // ---------------------------------------------------------------- filtering
   function ownerMatch(t, f) {
     if (f === 'all') return true;
-    if (f === 'unassigned') return !t.owner || !members().includes(t.owner);
-    return t.owner === f;
+    if (f === 'unassigned') return !t.owners.some(o => members().includes(o));
+    return t.owners.includes(f);
   }
   function statusMatch(t, f) {
     if (f === 'all') return true;
@@ -537,8 +544,8 @@
   function renderTask(t) {
     const subsDone = t.subtasks.filter(s => s.done).length;
     const meta = [];
-    meta.push(t.owner
-      ? `<span class="pill owner">${esc(t.owner)}</span>`
+    meta.push(t.owners.length
+      ? t.owners.map(o => `<span class="pill owner">${esc(o)}</span>`).join('')
       : `<span class="pill owner none">Unassigned</span>`);
     if (t.subtasks.length) meta.push(`<span title="Checklist">${ICON.list} ${subsDone}/${t.subtasks.length}</span>`);
     if (t.links.length) meta.push(`<span title="Links">${ICON.link} ${t.links.length}</span>`);
@@ -601,8 +608,8 @@
     const c = catById(t.category_id) || { name: '', color: '#999' };
     const ro = state.canEdit ? '' : 'readonly';
     const dis = state.canEdit ? '' : 'disabled';
-    const owners = members().slice();
-    if (t.owner && !owners.includes(t.owner)) owners.push(t.owner);
+    // Band members first, then anyone still assigned who has since left the members list.
+    const people = [...members(), ...t.owners.filter(o => !members().includes(o))];
     const subsDone = t.subtasks.filter(s => s.done).length;
     return `
       <div class="drawer-head">
@@ -619,19 +626,21 @@
         <p class="hint">${t.status_changed_at ? 'Set to' : 'Added as'} <strong>${STATUS_LABEL[t.status]}</strong> <span data-ago="${esc(statusAt(t))}">${esc(ago(statusAt(t)))}</span>${t.status_changed_by ? ` by ${esc(t.status_changed_by)}` : ''}</p>
       </div>
 
-      <div class="grid2">
-        <label class="field"><span class="label">Owner</span>
-          <select data-field="owner" ${dis}>
-            <option value="">Unassigned</option>
-            ${owners.map(m => `<option value="${esc(m)}" ${t.owner === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}
-          </select>
-        </label>
-        <label class="field"><span class="label">Category</span>
-          <select data-field="category_id" ${dis}>
-            ${state.categories.map(x => `<option value="${x.id}" ${x.id === t.category_id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
-          </select>
-        </label>
+      <div class="field">
+        <span class="label">Owners <small class="label-hint">tap to add or remove</small></span>
+        <div class="owner-chips" role="group" aria-label="Owners">
+          ${people.map(m => {
+            const on = t.owners.includes(m);
+            return `<button class="owner-chip ${on ? 'on' : ''}" data-action="toggle-owner" data-name="${esc(m)}" aria-pressed="${on}" ${dis}>${on ? ICON.check : ''}${esc(m)}</button>`;
+          }).join('') || '<span class="hint">Add band members in Settings first.</span>'}
+        </div>
       </div>
+
+      <label class="field"><span class="label">Category</span>
+        <select data-field="category_id" ${dis}>
+          ${state.categories.map(x => `<option value="${x.id}" ${x.id === t.category_id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+      </label>
 
       <span class="section-label">Checklist ${t.subtasks.length ? `<small>${subsDone}/${t.subtasks.length}</small>` : ''}</span>
       <div class="card">
@@ -801,6 +810,15 @@
         break;
       }
       case 'set-status': if (cur) updateTask(cur.id, { status: btn.dataset.status }); break;
+      case 'toggle-owner': {
+        if (!cur) break;
+        const name = btn.dataset.name;
+        const next = cur.owners.includes(name) ? cur.owners.filter(o => o !== name) : [...cur.owners, name];
+        // Keep owners in band-member order so tags always line up the same way.
+        const order = m => { const i = members().indexOf(m); return i < 0 ? 999 : i; };
+        updateTask(cur.id, { owners: next.sort((a, b) => order(a) - order(b)) });
+        break;
+      }
       case 'toggle-sub': {
         if (!cur) break;
         const i = +btn.dataset.i;
@@ -833,7 +851,7 @@
         break;
       }
       case 'remove-member': {
-        const n = state.tasks.filter(t => t.owner === btn.dataset.name).length;
+        const n = state.tasks.filter(t => t.owners.includes(btn.dataset.name)).length;
         if (confirmTap(btn, n ? `Remove? (${n} task${n > 1 ? 's' : ''} → unassigned)` : 'Remove?')) removeMember(btn.dataset.name);
         break;
       }
@@ -854,7 +872,6 @@
         v = v.replace(/\s+/g, ' ').trim();
         if (!v) { el.value = t.title; autosize(el); return; }
       }
-      if (el.dataset.field === 'owner') v = v || null;
       if (t[el.dataset.field] !== v) updateTask(t.id, { [el.dataset.field]: v }, { skipDrawer: el.dataset.field !== 'category_id' });
     } else if (el.dataset.setting === 'me') {
       state.me = el.value;
